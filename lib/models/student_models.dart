@@ -151,12 +151,16 @@ class Attendance {
   final String status;
   final DateTime date;
   final Schedule schedule;
+  final double? scannedLatitude; // NEW: Location data
+  final double? scannedLongitude; // NEW: Location data
 
   Attendance({
     required this.id,
     required this.status,
     required this.date,
     required this.schedule,
+    this.scannedLatitude,
+    this.scannedLongitude,
   });
 
   factory Attendance.fromJson(Map<String, dynamic> json) {
@@ -165,6 +169,8 @@ class Attendance {
       status: json['status'] ?? 'ALPHA',
       date: _safeParseDateTime(json['date']) ?? DateTime.now(),
       schedule: Schedule.fromJson(json['schedule'] ?? {}),
+      scannedLatitude: (json['scannedLatitude'] as num?)?.toDouble(), // NEW
+      scannedLongitude: (json['scannedLongitude'] as num?)?.toDouble(), // NEW
     );
   }
 }

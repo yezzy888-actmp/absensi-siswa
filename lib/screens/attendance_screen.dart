@@ -1,12 +1,16 @@
+// lib/screens/attendance_screen.dart
+
 import 'dart:ui';
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart'; // Recommended for haptic feedback
+import 'package:flutter/services.dart';
 import 'package:mobile_scanner/mobile_scanner.dart';
 import 'package:provider/provider.dart';
 import 'package:absensi_siswa/providers/auth_providers.dart';
 import 'package:absensi_siswa/providers/student_provider.dart';
 import 'package:absensi_siswa/theme/color_theme.dart';
 import 'package:absensi_siswa/utils/qr_helper.dart';
+import 'package:geolocator/geolocator.dart';
+import 'package:permission_handler/permission_handler.dart';
 
 class AttendanceScreen extends StatefulWidget {
   const AttendanceScreen({super.key});
@@ -22,13 +26,17 @@ class _AttendanceScreenState extends State<AttendanceScreen>
 
   bool _isProcessing = false;
   bool _isFlashOn = false;
-  // [ADDED] Variable untuk mencegah spam scanning
   DateTime? _lastScanTime;
   static const Duration _scanCooldown = Duration(seconds: 3);
 
   late AnimationController _animationController;
   late Animation<double> _scannerAnimation;
   late AnimationController _pulseController;
+
+  // State untuk menyimpan lokasi terakhir yang sukses diproses
+  double? _lastScannedLatitude;
+  double? _lastScannedLongitude;
+  String? _lastSuccessMessage;
 
   @override
   void initState() {
@@ -56,64 +64,84 @@ class _AttendanceScreenState extends State<AttendanceScreen>
     super.dispose();
   }
 
-  // [ADDED] Method untuk mengecek apakah masih dalam cooldown
+  // Method untuk mengecek apakah masih dalam cooldown
   bool _isInCooldown() {
     if (_lastScanTime == null) return false;
     return DateTime.now().difference(_lastScanTime!) < _scanCooldown;
   }
 
-  // [ADDED] Method untuk menampilkan countdown cooldown
+  // Method untuk menampilkan countdown cooldown
   void _showCooldownMessage() {
     final remainingTime =
         _scanCooldown.inSeconds -
         DateTime.now().difference(_lastScanTime!).inSeconds;
     _showFeedback('Tunggu ${remainingTime}s sebelum scan lagi', isError: false);
+    print(
+      'W/AttendanceScreen: Scan cooldown active. Remaining: ${remainingTime}s',
+    );
+  }
+
+  // Handle successful submission to update UI state
+  void _handleSuccess(String message, double? lat, double? lon) {
+    if (!mounted) return;
+    print(
+      'I/AttendanceScreen: Absensi Success. Lat: $lat, Lon: $lon. Message: $message',
+    );
+    setState(() {
+      _lastScannedLatitude = lat;
+      _lastScannedLongitude = lon;
+      _lastSuccessMessage = message;
+    });
+    _showFeedback(message, isError: false);
+    Future.delayed(const Duration(seconds: 2), () {
+      if (mounted) {
+        print('I/AttendanceScreen: Navigating back to /main screen...');
+        Navigator.pushNamedAndRemoveUntil(context, '/main', (route) => false);
+      }
+    });
   }
 
   Future<void> _submitAttendance(String? rawQRData) async {
+    print(
+      'I/AttendanceScreen: Starting attendance submission for data: $rawQRData',
+    );
+
     if (rawQRData == null || rawQRData.isEmpty) {
       _showFeedback('Token tidak boleh kosong.', isError: true);
+      print('E/AttendanceScreen: Submission stopped. QR Data is empty/null.');
       return;
     }
 
-    // [MODIFIED] Cek apakah masih dalam periode cooldown
     if (_isInCooldown()) {
       _showCooldownMessage();
       return;
     }
 
-    // The _isProcessing flag already prevents re-entry, this check is good.
     if (_isProcessing) return;
 
-    // [ADDED] Set waktu scan terakhir
     _lastScanTime = DateTime.now();
-
-    // A little haptic feedback can make the scan feel more responsive.
     HapticFeedback.lightImpact();
 
     setState(() {
       _isProcessing = true;
+      _lastSuccessMessage = null; // Clear previous success message
     });
 
-    // Parse QR data
     final Map<String, dynamic>? qrData = QRDataProcessor.parseQRData(rawQRData);
 
-    if (qrData == null) {
-      _showFeedback('Format QR Code tidak valid.', isError: true);
-      // [MODIFIED] Reset processing state on early exit
+    if (qrData == null || !QRDataProcessor.isValidAttendanceQR(qrData)) {
+      _showFeedback(
+        'Format QR Code tidak valid atau bukan untuk absensi.',
+        isError: true,
+      );
+      print('E/AttendanceScreen: Invalid QR format or not an attendance QR.');
       setState(() => _isProcessing = false);
       return;
     }
 
-    if (!QRDataProcessor.isValidAttendanceQR(qrData)) {
-      _showFeedback('QR Code bukan untuk absensi.', isError: true);
-      // [MODIFIED] Reset processing state on early exit
-      setState(() => _isProcessing = false);
-      return;
-    }
-
-    // [REMOVED] The confirmation dialog and its check have been removed.
-    // We now proceed directly to submitting the attendance.
+    print(
+      'I/AttendanceScreen: QR Data parsed successfully. Token: ${qrData['token']}',
+    );
 
     final authProvider = Provider.of<AuthProvider>(context, listen: false);
     final studentId = authProvider.user?['profileData']?['id'];
@@ -123,69 +151,116 @@ class _AttendanceScreenState extends State<AttendanceScreen>
         'Gagal mendapatkan data siswa. Silakan login ulang.',
         isError: true,
       );
+      print(
+        'E/AttendanceScreen: Student ID is null. User might not be logged in correctly.',
+      );
       setState(() {
         _isProcessing = false;
       });
       return;
     }
 
+    double? currentLat;
+    double? currentLon;
+
+    final studentProvider = Provider.of<StudentProvider>(
+      context,
+      listen: false,
+    );
+
+    // --- LOCATION ACQUISITION ---
+    print('I/AttendanceScreen: Starting location acquisition...');
     try {
-      final studentProvider = Provider.of<StudentProvider>(
-        context,
-        listen: false,
-      );
-
-      final result = await studentProvider.submitAttendance(
-        studentId,
-        qrData['token'].toString(),
-      );
-
-      if (!mounted) return;
-
-      // [MODIFIED] Periksa status keberhasilan dari provider
-      if (result['success'] == true) {
-        // Jika sukses, ambil pesan dari 'data'
-        final successMessage =
-            result['data']?['message'] ?? 'Absensi berhasil!';
-        _showFeedback(successMessage, isError: false);
-        Future.delayed(const Duration(seconds: 2), () {
-          if (mounted) {
-            Navigator.pushNamedAndRemoveUntil(
-              context,
-              '/main',
-              (route) => false,
-            );
-          }
-        });
+      final status = await Permission.locationWhenInUse.request();
+      if (status == PermissionStatus.granted) {
+        Position position = await Geolocator.getCurrentPosition(
+          desiredAccuracy: LocationAccuracy.high,
+          timeLimit: const Duration(seconds: 10),
+        );
+        currentLat = position.latitude;
+        currentLon = position.longitude;
+        print(
+          'I/AttendanceScreen: Location acquired successfully. Lat: $currentLat, Lon: $currentLon',
+        );
       } else {
-        // Jika gagal, ambil pesan error dari 'message'
-        final errorMessage = result['message'] ?? 'Terjadi kesalahan.';
+        // Lokasi tidak didapat/izin ditolak, kirim null
         _showFeedback(
-          errorMessage.replaceFirst('Exception: ', ''),
-          isError: true,
+          'Lokasi tidak tersedia untuk presensi ini.',
+          isError: false,
+        );
+        print(
+          'W/AttendanceScreen: Location permission denied or not granted. Sending null coordinates.',
         );
       }
     } catch (e) {
-      // Blok catch ini sekarang berfungsi sebagai fallback tambahan
-      if (!mounted) return;
-      _showFeedback(
-        e.toString().replaceFirst('Exception: ', ''),
-        isError: true,
+      final errorMessage =
+          'Gagal mendapatkan lokasi: ${e.toString().split('.')[0]}';
+      _showFeedback(errorMessage, isError: true);
+      currentLat = null;
+      currentLon = null;
+      print('E/AttendanceScreen: Failed to get location: $e');
+    }
+
+    // --- SUBMIT ATTENDANCE API CALL ---
+    print(
+      'I/AttendanceScreen: Calling API submitAttendance with Lat: $currentLat, Lon: $currentLon',
+    );
+    try {
+      final result = await studentProvider.submitAttendance(
+        studentId,
+        qrData['token'].toString(),
+        studentLatitude: currentLat, // Kirim lat/lon yang didapat (bisa null)
+        studentLongitude: currentLon, // Kirim lat/lon yang didapat (bisa null)
       );
+
+      if (!mounted) return;
+
+      if (result['success'] == true) {
+        // Panggil handler sukses baru
+        final successMessage =
+            result['data']?['message'] ?? 'Absensi berhasil!';
+        print('I/AttendanceScreen: API Success. Message: $successMessage');
+        _handleSuccess(
+          successMessage,
+          currentLat, // Kirim lat/lon yang didapat
+          currentLon, // Kirim lat/lon yang didapat
+        );
+      } else {
+        final errorMessage = result['message'] ?? 'Terjadi kesalahan.';
+        final cleanedMessage = errorMessage.replaceFirst('Exception: ', '');
+        print(
+          'E/AttendanceScreen: API Failed. Error: $cleanedMessage. Full result: $result',
+        );
+        _showFeedback(cleanedMessage, isError: true);
+      }
+    } catch (e) {
+      if (!mounted) return;
+      final cleanedError = e.toString().replaceFirst('Exception: ', '');
+      print(
+        'E/AttendanceScreen: API Call failed with Exception: $cleanedError',
+      );
+      _showFeedback(cleanedError, isError: true);
     } finally {
       if (mounted) {
         setState(() {
           _isProcessing = false;
         });
+        print(
+          'I/AttendanceScreen: Processing finished. _isProcessing set to false.',
+        );
       }
     }
   }
 
-  // The rest of your widgets (_buildInfoRow, _formatDateTime, etc.) are well-built
-  // and do not need changes for this request. I've kept them here for completeness.
-
   void _showFeedback(String message, {required bool isError}) {
+    // ... (implementasi _showFeedback tetap sama, hanya perlu dipastikan tidak menampilkan pesan sukses yang lama)
     if (!mounted) return;
+    // Logika: Jika ini pesan success, kita tidak mau menampilkan pesan ini jika _handleSuccess sudah memicu navigasi
+    if (!isError &&
+        _lastSuccessMessage != null &&
+        message == _lastSuccessMessage)
+      return;
+
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
         content: Row(
@@ -218,21 +293,29 @@ class _AttendanceScreenState extends State<AttendanceScreen>
   }
 
   void _toggleFlash() async {
+    // ... (sama seperti sebelumnya)
     try {
       await _scannerController.toggleTorch();
       setState(() {
         _isFlashOn = !_isFlashOn;
       });
+      print(
+        'I/AttendanceScreen: Flashlight toggled. Current state: $_isFlashOn',
+      );
     } catch (e) {
       _showFeedback('Gagal mengatur flash', isError: true);
+      print('E/AttendanceScreen: Failed to toggle flashlight: $e');
     }
   }
 
   void _switchCamera() async {
+    // ... (sama seperti sebelumnya)
     try {
       await _scannerController.switchCamera();
+      print('I/AttendanceScreen: Camera switched.');
     } catch (e) {
       _showFeedback('Gagal beralih kamera', isError: true);
+      print('E/AttendanceScreen: Failed to switch camera: $e');
     }
   }
 
@@ -242,7 +325,6 @@ class _AttendanceScreenState extends State<AttendanceScreen>
       backgroundColor: AppColorTheme.background,
       extendBodyBehindAppBar: true,
       appBar: AppBar(
-        // Your AppBar is great, no changes needed.
         backgroundColor: Colors.transparent,
         elevation: 0,
         leading: Container(
@@ -258,7 +340,10 @@ class _AttendanceScreenState extends State<AttendanceScreen>
               color: AppColorTheme.foreground,
               size: 20,
             ),
-            onPressed: () => Navigator.pop(context),
+            onPressed: () {
+              print('I/AttendanceScreen: Back button pressed.');
+              Navigator.pop(context);
+            },
           ),
         ),
         title: Container(
@@ -330,23 +415,37 @@ class _AttendanceScreenState extends State<AttendanceScreen>
               child: MobileScanner(
                 controller: _scannerController,
                 onDetect: (capture) {
-                  // [MODIFIED] Tambahkan pengecekan cooldown di sini juga
-                  if (_isProcessing || _isInCooldown()) return;
+                  if (_isProcessing || _isInCooldown()) {
+                    if (_isInCooldown()) {
+                      print(
+                        'W/AttendanceScreen: Scanner detected but cooldown is active.',
+                      );
+                    } else if (_isProcessing) {
+                      print(
+                        'W/AttendanceScreen: Scanner detected but already processing.',
+                      );
+                    }
+                    return;
+                  }
                   final String? scannedToken = capture.barcodes.first.rawValue;
-
-                  // [REMOVED] Do not stop the scanner.
-                  // _scannerController.stop();
-
-                  // [MODIFIED] Directly submit the attendance.
+                  print(
+                    'I/AttendanceScreen: QR Code scanned. Raw value: $scannedToken',
+                  );
                   _submitAttendance(scannedToken);
                 },
               ),
             ),
 
-            // Scanner Overlay - no changes needed, it's great!
+            // Scanner Overlay
             _buildScannerOverlay(context),
 
-            // Bottom Section - no changes needed
+            // [ADDED] Lokasi Indikator (muncul setelah sukses)
+            if (_lastScannedLatitude != null &&
+                _lastSuccessMessage != null &&
+                !_isProcessing)
+              _buildLocationIndicator(context),
+
+            // Bottom Section
             Positioned(
               bottom: 0,
               left: 0,
@@ -354,18 +453,13 @@ class _AttendanceScreenState extends State<AttendanceScreen>
               child: _buildBottomSection(),
             ),
 
-            // Processing Overlay - no changes needed
+            // Processing Overlay
             if (_isProcessing) _buildProcessingOverlay(),
           ],
         ),
       ),
     );
   }
-
-  // No changes are needed for the widgets below this point.
-  // _buildScannerOverlay, _buildBottomSection, _buildAlternativeButton,
-  // _showManualInputSheet, _buildManualInputSection, _buildProcessingOverlay
-  // can all remain as they are. They are well-implemented.
 
   Widget _buildScannerOverlay(BuildContext context) {
     final size = MediaQuery.of(context).size;
@@ -375,126 +469,179 @@ class _AttendanceScreenState extends State<AttendanceScreen>
       child: Column(
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
-          // Instruction Text
-          Container(
-            margin: const EdgeInsets.symmetric(horizontal: 32),
-            padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
-            decoration: BoxDecoration(
-              color: AppColorTheme.glassBackground,
-              borderRadius: BorderRadius.circular(25),
-              border: Border.all(color: AppColorTheme.glassBorder, width: 1),
-              boxShadow: [
-                BoxShadow(
-                  color: AppColorTheme.blueShadow,
-                  blurRadius: 20,
-                  offset: const Offset(0, 4),
-                ),
-              ],
+          // Instruction Text (Hidden jika sukses dan menampilkan lokasi)
+          if (_lastSuccessMessage == null)
+            Container(
+              margin: const EdgeInsets.symmetric(horizontal: 32),
+              padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+              decoration: BoxDecoration(
+                color: AppColorTheme.glassBackground,
+                borderRadius: BorderRadius.circular(25),
+                border: Border.all(color: AppColorTheme.glassBorder, width: 1),
+                boxShadow: [
+                  BoxShadow(
+                    color: AppColorTheme.blueShadow,
+                    blurRadius: 20,
+                    offset: const Offset(0, 4),
+                  ),
+                ],
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Container(
+                    padding: const EdgeInsets.all(8),
+                    decoration: BoxDecoration(
+                      gradient: AppColorTheme.primaryLinearGradient,
+                      borderRadius: BorderRadius.circular(10),
+                    ),
+                    child: const Icon(
+                      Icons.qr_code_scanner,
+                      color: Colors.white,
+                      size: 20,
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  const Text(
+                    'Arahkan kamera ke QR Code',
+                    style: TextStyle(
+                      color: AppColorTheme.foreground,
+                      fontSize: 16,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ],
+              ),
             ),
-            child: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Container(
-                  padding: const EdgeInsets.all(8),
-                  decoration: BoxDecoration(
-                    gradient: AppColorTheme.primaryLinearGradient,
-                    borderRadius: BorderRadius.circular(10),
-                  ),
-                  child: const Icon(
-                    Icons.qr_code_scanner,
-                    color: Colors.white,
-                    size: 20,
-                  ),
-                ),
-                const SizedBox(width: 12),
-                const Text(
-                  'Arahkan kamera ke QR Code',
-                  style: TextStyle(
-                    color: AppColorTheme.foreground,
-                    fontSize: 16,
-                    fontWeight: FontWeight.w600,
-                  ),
-                ),
-              ],
-            ),
-          ),
 
           const SizedBox(height: 40),
 
-          // Animated Scanner Frame
-          AnimatedBuilder(
-            animation: _pulseController,
-            builder: (context, child) {
-              return Container(
-                width: scanArea + (_pulseController.value * 20),
-                height: scanArea + (_pulseController.value * 20),
-                decoration: BoxDecoration(
-                  borderRadius: BorderRadius.circular(24),
-                  border: Border.all(
-                    color: AppColorTheme.primary.withOpacity(0.8),
-                    width: 3,
-                  ),
-                  boxShadow: [
-                    BoxShadow(
-                      color: AppColorTheme.primary.withOpacity(0.3),
-                      blurRadius: 20 + (_pulseController.value * 10),
-                      spreadRadius: 2 + (_pulseController.value * 5),
+          // Animated Scanner Frame (Hidden jika sukses dan menampilkan lokasi)
+          if (_lastSuccessMessage == null)
+            AnimatedBuilder(
+              animation: _pulseController,
+              builder: (context, child) {
+                return Container(
+                  width: scanArea + (_pulseController.value * 20),
+                  height: scanArea + (_pulseController.value * 20),
+                  decoration: BoxDecoration(
+                    borderRadius: BorderRadius.circular(24),
+                    border: Border.all(
+                      color: AppColorTheme.primary.withOpacity(0.8),
+                      width: 3,
                     ),
-                  ],
-                ),
-                child: Stack(
-                  children: [
-                    // Corner indicators
-                    ...List.generate(4, (index) {
-                      return Positioned(
-                        top: index < 2 ? 16 : null,
-                        bottom: index >= 2 ? 16 : null,
-                        left: index % 2 == 0 ? 16 : null,
-                        right: index % 2 == 1 ? 16 : null,
-                        child: Container(
-                          width: 30,
-                          height: 30,
-                          decoration: BoxDecoration(
-                            gradient: AppColorTheme.primaryLinearGradient,
-                            borderRadius: BorderRadius.circular(8),
-                          ),
-                        ),
-                      );
-                    }),
-
-                    // Scanning line
-                    AnimatedBuilder(
-                      animation: _scannerAnimation,
-                      builder: (context, child) {
+                    boxShadow: [
+                      BoxShadow(
+                        color: AppColorTheme.primary.withOpacity(0.3),
+                        blurRadius: 20 + (_pulseController.value * 10),
+                        spreadRadius: 2 + (_pulseController.value * 5),
+                      ),
+                    ],
+                  ),
+                  child: Stack(
+                    children: [
+                      // Corner indicators
+                      ...List.generate(4, (index) {
                         return Positioned(
-                          top: 20 + (_scannerAnimation.value * (scanArea - 60)),
-                          left: 20,
-                          right: 20,
+                          top: index < 2 ? 16 : null,
+                          bottom: index >= 2 ? 16 : null,
+                          left: index % 2 == 0 ? 16 : null,
+                          right: index % 2 == 1 ? 16 : null,
                           child: Container(
-                            height: 3,
+                            width: 30,
+                            height: 30,
                             decoration: BoxDecoration(
-                              gradient: LinearGradient(
-                                colors: [
-                                  Colors.transparent,
-                                  AppColorTheme.accent,
-                                  AppColorTheme.primary,
-                                  AppColorTheme.accent,
-                                  Colors.transparent,
-                                ],
-                              ),
-                              borderRadius: BorderRadius.circular(2),
+                              gradient: AppColorTheme.primaryLinearGradient,
+                              borderRadius: BorderRadius.circular(8),
                             ),
                           ),
                         );
-                      },
-                    ),
-                  ],
-                ),
-              );
-            },
-          ),
-          SizedBox(height: scanArea * 0.3),
+                      }),
+
+                      // Scanning line
+                      AnimatedBuilder(
+                        animation: _scannerAnimation,
+                        builder: (context, child) {
+                          return Positioned(
+                            top:
+                                20 +
+                                (_scannerAnimation.value * (scanArea - 60)),
+                            left: 20,
+                            right: 20,
+                            child: Container(
+                              height: 3,
+                              decoration: BoxDecoration(
+                                gradient: LinearGradient(
+                                  colors: [
+                                    Colors.transparent,
+                                    AppColorTheme.accent,
+                                    AppColorTheme.primary,
+                                    AppColorTheme.accent,
+                                    Colors.transparent,
+                                  ],
+                                ),
+                                borderRadius: BorderRadius.circular(2),
+                              ),
+                            ),
+                          );
+                        },
+                      ),
+                    ],
+                  ),
+                );
+              },
+            ),
+
+          const SizedBox(height: 40),
+          // Placeholder spacing if scanner overlay is hidden
+          if (_lastSuccessMessage != null) SizedBox(height: scanArea * 0.3),
         ],
+      ),
+    );
+  }
+
+  // NEW WIDGET: Menampilkan lokasi setelah sukses
+  Widget _buildLocationIndicator(BuildContext context) {
+    return Center(
+      child: Container(
+        margin: const EdgeInsets.symmetric(horizontal: 32),
+        padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
+        decoration: BoxDecoration(
+          color: AppColorTheme.success.withOpacity(0.95),
+          borderRadius: BorderRadius.circular(16),
+          border: Border.all(color: Colors.white, width: 2),
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Icon(Icons.location_on, color: Colors.white, size: 32),
+            const SizedBox(height: 10),
+            const Text(
+              "Lokasi Terkirim!",
+              style: TextStyle(
+                color: Colors.white,
+                fontSize: 18,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              "Lat: ${_lastScannedLatitude!.toStringAsFixed(5)}\nLon: ${_lastScannedLongitude!.toStringAsFixed(5)}",
+              textAlign: TextAlign.center,
+              style: const TextStyle(color: Colors.white70, fontSize: 13),
+            ),
+            const SizedBox(height: 4),
+            Text(
+              _lastSuccessMessage!,
+              textAlign: TextAlign.center,
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 14,
+                fontWeight: FontWeight.w500,
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -554,6 +701,7 @@ class _AttendanceScreenState extends State<AttendanceScreen>
             label: 'Input Manual',
             onTap: () {
               if (!_isProcessing) {
+                print('I/AttendanceScreen: Manual input button pressed.');
                 _showManualInputSheet(context);
               }
             },
@@ -596,6 +744,8 @@ class _AttendanceScreenState extends State<AttendanceScreen>
   }
 
   void _showManualInputSheet(BuildContext context) {
+    // Panggil _submitAttendance dengan nilai null untuk lat/lon saat input manual
+    // agar backend yang menangani.
     showModalBottomSheet(
       context: context,
       isScrollControlled: true,
@@ -707,8 +857,12 @@ class _AttendanceScreenState extends State<AttendanceScreen>
                 shadowColor: Colors.transparent,
               ),
               onPressed: () {
+                final token = _tokenController.text;
                 Navigator.pop(context);
-                _submitAttendance(_tokenController.text);
+                print(
+                  'I/AttendanceScreen: Manual token submitted: $token. Starting submission...',
+                );
+                _submitAttendance(token); // Panggil dengan lat/lon null
               },
               child: const Row(
                 mainAxisAlignment: MainAxisAlignment.center,

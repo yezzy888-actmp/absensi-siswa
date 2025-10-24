@@ -7,7 +7,7 @@ import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import '../models/student_models.dart';
 
 class StudentService {
-  static const String baseUrl = 'http://10.0.2.2:5000/api';
+  static const String baseUrl = 'https://absen-blond.vercel.app/api';
   static const FlutterSecureStorage _storage = FlutterSecureStorage();
 
   Future<Map<String, String>> _getHeaders() async {
@@ -182,14 +182,21 @@ class StudentService {
     }
   }
 
-  /// Submits attendance for a student using a session token
+  /// Submits attendance for a student using a session token (MODIFIED FOR GEO)
   Future<Map<String, dynamic>> submitAttendance(
     String studentId,
-    String token,
-  ) async {
+    String token, {
+    double? studentLatitude, // NEW PARAMETER
+    double? studentLongitude, // NEW PARAMETER
+  }) async {
     try {
       final headers = await _getHeaders();
-      final body = jsonEncode({'token': token});
+      // MODIFIED BODY: Include optional lat/lon
+      final body = jsonEncode({
+        'token': token,
+        if (studentLatitude != null) 'studentLatitude': studentLatitude,
+        if (studentLongitude != null) 'studentLongitude': studentLongitude,
+      });
       final response = await http.post(
         Uri.parse('$baseUrl/students/$studentId/submit-attendance'),
         headers: headers,

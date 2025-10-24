@@ -41,7 +41,7 @@ class StudentProvider with ChangeNotifier {
 
   // --- Metode Fetching Data ---
 
-  /// [STRATEGI BARU]
+  /// [STRATEGY BARU]
   /// Mengganti panggilan tunggal ke /dashboard dengan beberapa panggilan API
   /// yang lebih stabil dan merakit datanya di sisi Flutter.
   Future<void> fetchStudentDashboard(String studentId) async {
@@ -201,12 +201,20 @@ class StudentProvider with ChangeNotifier {
 
   // --- Metode Aksi (Update/Submit) ---
 
+  // MODIFIED: Accept optional lat/lon parameters
   Future<Map<String, dynamic>> submitAttendance(
     String studentId,
-    String token,
-  ) async {
+    String token, {
+    double? studentLatitude,
+    double? studentLongitude,
+  }) async {
     try {
-      final result = await _studentService.submitAttendance(studentId, token);
+      final result = await _studentService.submitAttendance(
+        studentId,
+        token,
+        studentLatitude: studentLatitude,
+        studentLongitude: studentLongitude,
+      );
       fetchStudentDashboard(studentId); // Refresh dashboard di background
       return {'success': true, 'data': result};
     } catch (e) {
